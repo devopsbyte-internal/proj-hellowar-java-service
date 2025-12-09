@@ -1,0 +1,147 @@
+
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.devopsbyte.app</groupId>
+  <artifactId>hello-war</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>war</packaging>
+  <name>hello-war</name>
+  <description>Phase-1 Hello WAR for Tomcat 10.1 (Jakarta), Java 17</description>
+
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.release>17</maven.compiler.release>
+    <junit.jupiter.version>5.10.2</junit.jupiter.version>
+    <!-- JaCoCo XML report path for SonarCloud -->
+    <sonar.coverage.jacoco.xmlReportPaths>
+      ${project.reporting.outputDirectory}/jacoco/jacoco.xml
+    </sonar.coverage.jacoco.xmlReportPaths>
+  </properties>
+
+
+
+  <dependencies>
+    <!-- Servlet API provided by Tomcat at runtime -->
+    <dependency>
+      <groupId>jakarta.servlet</groupId>
+      <artifactId>jakarta.servlet-api</artifactId>
+      <version>6.0.0</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <!-- JUnit 5 Test API -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-api</artifactId>
+      <version>${junit.jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- runtime engine -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-engine</artifactId>
+      <version>${junit.jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+    
+    <!-- (optional) parameterized tests -->
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter-params</artifactId>
+      <version>${junit.jupiter.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- Optional PostgreSQL JDBC driver for external DB logging -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <version>42.7.2</version>
+      <scope>runtime</scope>
+    </dependency>
+
+    </dependencies>
+
+
+
+  <build>
+    <finalName>${project.artifactId}-${project.version}</finalName>
+
+    <resources>
+     <resource>
+       <directory>src/main/resources</directory>
+       <filtering>true</filtering>
+     </resource>
+    </resources>
+
+           
+    <plugins>
+    <!-- Jacoco code coverage plugin -->
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.11</version>
+        <executions>
+          <!-- Attach JaCoCo agent to tests -->
+          <execution>
+            <goals>
+              <goal>prepare-agent</goal>
+            </goals>
+          </execution>
+          <!-- Generate XML report after tests -->
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals>
+              <goal>report</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+        <configuration>
+          <release>${maven.compiler.release}</release>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-war-plugin</artifactId>
+        <version>3.3.2</version>
+        <configuration>
+          <failOnMissingWebXml>false</failOnMissingWebXml>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+
+
+  <distributionManagement>
+  <repository>
+    <id>devopsbyte-maven-releases</id>
+    <url>https://devopsbyte.jfrog.io/artifactory/devopsbyte-maven-releases</url>
+  </repository>
+  <snapshotRepository>
+    <id>devopsbyte-maven-snapshots</id>
+    <url>https://devopsbyte.jfrog.io/artifactory/devopsbyte-maven-snapshots</url>
+  </snapshotRepository>
+</distributionManagement>
+
+</project>
