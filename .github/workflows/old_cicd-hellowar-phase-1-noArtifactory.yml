@@ -18,28 +18,6 @@ on:
         type: boolean
         required: false
         default: true
-db_enabled:
-  description: 'Enable DB telemetry on the backend? (DB_ENABLED)'
-  type: choice
-  required: false
-  default: 'false'
-  options:
-    - 'false'
-    - 'true'
-release_number:
-  description: 'Release number exposed via API (RELEASE_NUMBER)'
-  required: false
-  default: 'manual'
-
-# -----------------------------
-# PPPP NOTE:
-# - DB is OFF by default.
-# - You can enable DB in workflow_dispatch input, OR force it below in code.
-# - Force wins over input. Empty string means "no force".
-# -----------------------------
-env:
-  DB_ENABLED_FORCE: ''      # <-- set to 'true' or 'false' to override the input
-  RELEASE_NUMBER_FORCE: ''  # <-- set to a value to override the input (optional)
 
 jobs:
   build:
@@ -206,37 +184,6 @@ deploy:
     - name: Set EC2 host env
       run: echo "EC2_HOST=${{ steps.get_ip.outputs.ec2_ip }}" >> $GITHUB_ENV
 
-    - name: Decide DB_ENABLED + RELEASE_NUMBER (force > input > default)
-      # PPPP NOTE: This is the single source of truth for runtime toggles.
-      run: |
-        set -euo pipefail
-
-        # -----------------------------
-        # DB_ENABLED precedence:
-        # 1) env.DB_ENABLED_FORCE (if set to true/false)
-        # 2) workflow_dispatch input db_enabled
-        # 3) default false
-        # -----------------------------
-        FINAL_DB_ENABLED="${{ github.event.inputs.db_enabled || 'false' }}"
-        if [ -n "${DB_ENABLED_FORCE}" ]; then
-          FINAL_DB_ENABLED="${DB_ENABLED_FORCE}"
-        fi
-        echo "DB_ENABLED=${FINAL_DB_ENABLED}" >> "$GITHUB_ENV"
-        echo "Final DB_ENABLED=${FINAL_DB_ENABLED}"
-
-        # -----------------------------
-        # RELEASE_NUMBER precedence:
-        # 1) env.RELEASE_NUMBER_FORCE (if non-empty)
-        # 2) workflow_dispatch input release_number
-        # 3) default manual
-        # -----------------------------
-        FINAL_RELEASE_NUMBER="${{ github.event.inputs.release_number || 'manual' }}"
-        if [ -n "${RELEASE_NUMBER_FORCE}" ]; then
-          FINAL_RELEASE_NUMBER="${RELEASE_NUMBER_FORCE}"
-        fi
-        echo "RELEASE_NUMBER=${FINAL_RELEASE_NUMBER}" >> "$GITHUB_ENV"
-        echo "Final RELEASE_NUMBER=${FINAL_RELEASE_NUMBER}"
-
     - name: Download WAR artifact from build job
       uses: actions/download-artifact@v4
       with:
@@ -261,97 +208,47 @@ deploy:
         set -euo pipefail
         scp -o StrictHostKeyChecking=no "$WAR_PATH" "${{ vars.EC2_USER }}@$EC2_HOST:/tmp/hellowar.war"
 
-        - name: Deploy WAR on EC2 (no deploy.sh)
-          run: |
-            set -euo pipefail
-            ssh -o StrictHostKeyChecking=no "${{ vars.EC2_USER }}@$EC2_HOST" "DB_ENABLED='$DB_ENABLED' RELEASE_NUMBER='$RELEASE_NUMBER' DB_URL='${{ secrets.DB_URL }}' DB_USER='${{ secrets.DB_USER }}' DB_PASSWORD='${{ secrets.DB_PASSWORD }}' bash -s" << 'EOF'
-            # PPPP NOTE: Add secrets DB_URL/DB_USER/DB_PASSWORD in repo settings. They are used only when DB_ENABLED=true.
-            set -euo pipefail
+    - name: Deploy WAR on EC2 (no deploy.sh)
+      run: |
+        set -euo pipefail
+        ssh -o StrictHostKeyChecking=no "${{ vars.EC2_USER }}@$EC2_HOST" "bash -s" << 'EOF'
+        set -euo pipefail
 
-            TOMCAT_SERVICE_NAME="tomcat"
-            TOMCAT_WEBAPPS_DIR="/opt/tomcat/webapps"
-            DEPLOY_WAR_PATH="${TOMCAT_WEBAPPS_DIR}/hellowar.war"
-            EXPLODED_DIR="${TOMCAT_WEBAPPS_DIR}/hellowar"
-            HEALTH_URL="http://localhost:8080/hellowar/api/health"  # <-- NEW Phase-B health endpoint
+        TOMCAT_SERVICE_NAME="tomcat"
+        TOMCAT_WEBAPPS_DIR="/opt/tomcat/webapps"
+        DEPLOY_WAR_PATH="${TOMCAT_WEBAPPS_DIR}/hellowar.war"
+        EXPLODED_DIR="${TOMCAT_WEBAPPS_DIR}/hellowar"
+        HEALTH_URL="http://localhost:8080/hellowar/"
 
-            # -----------------------------
-            # Runtime env file (PPPP)
-            # - Written on every deploy so runtime is deterministic.
-            # - DB is optional and best-effort telemetry.
-            # - Tomcat service should read this via EnvironmentFile (we ensure a drop-in exists).
-            # -----------------------------
-            ENV_DIR="/etc/hellowar"
-            ENV_FILE="${ENV_DIR}/hellowar.env"
+        echo "[remote] Validating Tomcat webapps dir..."
+        sudo test -d "$TOMCAT_WEBAPPS_DIR"
 
-            echo "[remote] Writing runtime env file: ${ENV_FILE}"
-            sudo mkdir -p "${ENV_DIR}"
+        echo "[remote] Installing WAR..."
+        sudo cp /tmp/hellowar.war "$DEPLOY_WAR_PATH"
+        sudo chmod 640 "$DEPLOY_WAR_PATH"
+        sudo chown tomcat:tomcat "$DEPLOY_WAR_PATH" || true
 
-            # Create/overwrite the env file atomically
-            sudo tee "${ENV_FILE}" > /dev/null <<EOT
-            RELEASE_NUMBER=${RELEASE_NUMBER}
-            DB_ENABLED=${DB_ENABLED}
-            EOT
+        echo "[remote] Removing exploded dir (if present)..."
+        sudo rm -rf "$EXPLODED_DIR" || true
 
-            if [ "${DB_ENABLED}" = "true" ]; then
-              # Only write DB creds when DB is enabled
-              # IMPORTANT: Do NOT echo these values to logs.
-              sudo tee -a "${ENV_FILE}" > /dev/null <<EOT
-            DB_URL=${DB_URL}
-            DB_USER=${DB_USER}
-            DB_PASSWORD=${DB_PASSWORD}
-            EOT
-            fi
+        echo "[remote] Restarting Tomcat..."
+        sudo systemctl restart "$TOMCAT_SERVICE_NAME"
 
-            sudo chmod 640 "${ENV_FILE}"
-            sudo chown root:tomcat "${ENV_FILE}" || true
+        echo "[remote] Health check: $HEALTH_URL"
+        MAX_ATTEMPTS=20
+        SLEEP_SECONDS=3
+        attempt=1
+        while (( attempt <= MAX_ATTEMPTS )); do
+          if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then
+            echo "[remote] Health check OK on attempt $attempt"
+            exit 0
+          fi
+          echo "[remote] Health check failed ($attempt/$MAX_ATTEMPTS). Retrying in ${SLEEP_SECONDS}s..."
+          sleep "$SLEEP_SECONDS"
+          ((attempt++))
+        done
 
-            # Ensure Tomcat reads the env file via a systemd drop-in (idempotent)
-            DROPIN_DIR="/etc/systemd/system/${TOMCAT_SERVICE_NAME}.service.d"
-            DROPIN_FILE="${DROPIN_DIR}/hellowar-env.conf"
-            if ! sudo test -f "${DROPIN_FILE}"; then
-              echo "[remote] Creating systemd drop-in to load ${ENV_FILE}"
-              sudo mkdir -p "${DROPIN_DIR}"
-              sudo tee "${DROPIN_FILE}" > /dev/null <<EOT
-            [Service]
-            EnvironmentFile=${ENV_FILE}
-            EOT
-              sudo systemctl daemon-reload
-            fi
-
-                    echo "[remote] Validating Tomcat webapps dir..."
-                    sudo test -d "$TOMCAT_WEBAPPS_DIR"
-
-                    echo "[remote] Installing WAR..."
-                    sudo cp /tmp/hellowar.war "$DEPLOY_WAR_PATH"
-                    sudo chmod 640 "$DEPLOY_WAR_PATH"
-                    sudo chown tomcat:tomcat "$DEPLOY_WAR_PATH" || true
-
-                    echo "[remote] Removing exploded dir (if present)..."
-                    sudo rm -rf "$EXPLODED_DIR" || true
-
-                    echo "[remote] Restarting Tomcat..."
-                    sudo systemctl restart "$TOMCAT_SERVICE_NAME"
-
-                    echo "[remote] Health check: $HEALTH_URL"
-                    MAX_ATTEMPTS=20
-                    SLEEP_SECONDS=3
-                    attempt=1
-                    while (( attempt <= MAX_ATTEMPTS )); do
-                      if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then
-                        echo "[remote] Health check OK on attempt $attempt"
-                        exit 0
-                      fi
-                      echo "[remote] Health check failed ($attempt/$MAX_ATTEMPTS). Retrying in ${SLEEP_SECONDS}s..."
-                      sleep "$SLEEP_SECONDS"
-                      ((attempt++))
-                    done
-
-                    echo "[remote] Health check failed after ${MAX_ATTEMPTS} attempts."
-            echo "[remote] ---- Diagnostics (PPPP) ----"
-            sudo systemctl status "$TOMCAT_SERVICE_NAME" --no-pager || true
-            sudo journalctl -u "$TOMCAT_SERVICE_NAME" -n 200 --no-pager || true
-            echo "[remote] webapps dir:"
-            ls -la "$TOMCAT_WEBAPPS_DIR" || true
-            echo "[remote] ---- End diagnostics ----"
-                    exit 1
-                    EOF
+        echo "[remote] Health check failed after ${MAX_ATTEMPTS} attempts."
+        echo "[remote] Check logs under /opt/tomcat/logs"
+        exit 1
+        EOF

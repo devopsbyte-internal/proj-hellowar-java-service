@@ -1,5 +1,8 @@
 
 name: CI/CD - HelloWar (Phase-1)
+
+# Setting up run name dynamically or as run-description entered(when non empty) ---- Else all runs look same (no commit message as in when pushed)
+# Defaults to manual trigger (also as description input also defaults to same)
 run-name: >
   ${{ github.event.inputs.run_description != '' && github.event.inputs.run_description || 'Manual Trigger' }}
 
@@ -16,32 +19,6 @@ on:
         type: boolean
         required: false
         default: true
-deploy_version:
-  description: 'Version to deploy from Artifactory (used by deploy.sh). Example: 1.0.0'
-  required: true
-  default: '1.0.0'
-db_enabled:
-  description: 'Enable DB telemetry on the backend? (DB_ENABLED)'
-  type: choice
-  required: false
-  default: 'false'
-  options:
-    - 'false'
-    - 'true'
-release_number:
-  description: 'Release number exposed via API (RELEASE_NUMBER)'
-  required: false
-  default: 'manual'
-
-# -----------------------------
-# PPPP NOTE:
-# - DB is OFF by default.
-# - You can enable DB in workflow_dispatch input, OR force it below in code.
-# - Force wins over input. Empty string means "no force".
-# -----------------------------
-env:
-  DB_ENABLED_FORCE: ''      # <-- set to 'true' or 'false' to override the input
-  RELEASE_NUMBER_FORCE: ''  # <-- set to a value to override the input (optional)
 
 jobs:
   build:
@@ -60,7 +37,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # full history for SonarQube analysis
+          fetch-depth: 0
+          # full history for SonarQube analysis -- History of All Commits / branches / tags. Not just current commit. Default = 1 (Current commit). Almost like git clone.
+          # Else sonar determination of new vs old code.
           
          
       - name: Set up JDK 17
@@ -69,10 +48,13 @@ jobs:
           distribution: temurin
           java-version: 17
           # This will be used for across runs in this repo so initially disable to test Artifactory Cache.
+          # Caching between workflow runs.... caching ~/.m2/repository
           cache: maven
 
 
       - name: Write Maven settings (.m2/settings.xml)
+        # 'XML' heredoc - the env variables (env.JFROG_USER) will be written literally (no expansion of vars)
+        # <id> tages should match the ids in pom.xml 
         run: |
           mkdir -p $HOME/.m2
           cat > $HOME/.m2/settings.xml <<'XML'
@@ -130,7 +112,8 @@ jobs:
           
 
 
-      - name: Run unit tests
+      - name: Run unit tests # Fail Fast; if step fails - workflow exits
+        # -B : Batch mode (non-interactive, no progress bars, used for CI) | -ntp: no transfer progress | clean = deletes target dir before test
         run: mvn -B -ntp clean test
 
       
@@ -222,80 +205,3 @@ jobs:
                   ARTIFACTORY_USER='$ARTIFACTORY_USER' \
                   ARTIFACTORY_TOKEN='$ARTIFACTORY_TOKEN' \
                   /opt/deploy/deploy.sh '${{ github.event.inputs.deploy_version }}'"
-
-
-      - name: Write runtime env file + restart Tomcat + health check (PPPP)
-        # PPPP NOTE:
-        # - We always write /etc/hellowar/hellowar.env so runtime is deterministic.
-        # - DB is optional. If enabled but broken, API returns success with a warning.
-        run: |
-          set -euo pipefail
-
-          ssh -o StrictHostKeyChecking=no "${{ vars.EC2_USER }}@$EC2_HOST"             "DB_ENABLED='$DB_ENABLED' RELEASE_NUMBER='$RELEASE_NUMBER' DB_URL='${{ secrets.DB_URL }}' DB_USER='${{ secrets.DB_USER }}' DB_PASSWORD='${{ secrets.DB_PASSWORD }}' bash -s" << 'EOF'
-          set -euo pipefail
-
-          TOMCAT_SERVICE_NAME="tomcat"
-          HEALTH_URL="http://localhost:8080/hellowar/api/health"  # <-- NEW Phase-B health endpoint
-
-          ENV_DIR="/etc/hellowar"
-          ENV_FILE="${ENV_DIR}/hellowar.env"
-
-          echo "[remote] Writing runtime env file: ${ENV_FILE}"
-          sudo mkdir -p "${ENV_DIR}"
-
-          sudo tee "${ENV_FILE}" > /dev/null <<EOT
-          RELEASE_NUMBER=${RELEASE_NUMBER}
-          DB_ENABLED=${DB_ENABLED}
-          EOT
-
-          if [ "${DB_ENABLED}" = "true" ]; then
-            # Only write DB creds when DB is enabled
-            sudo tee -a "${ENV_FILE}" > /dev/null <<EOT
-          DB_URL=${DB_URL}
-          DB_USER=${DB_USER}
-          DB_PASSWORD=${DB_PASSWORD}
-          EOT
-          fi
-
-          sudo chmod 640 "${ENV_FILE}"
-          sudo chown root:tomcat "${ENV_FILE}" || true
-
-          # Ensure Tomcat reads the env file via a systemd drop-in (idempotent)
-          DROPIN_DIR="/etc/systemd/system/${TOMCAT_SERVICE_NAME}.service.d"
-          DROPIN_FILE="${DROPIN_DIR}/hellowar-env.conf"
-          if ! sudo test -f "${DROPIN_FILE}"; then
-            echo "[remote] Creating systemd drop-in to load ${ENV_FILE}"
-            sudo mkdir -p "${DROPIN_DIR}"
-            sudo tee "${DROPIN_FILE}" > /dev/null <<EOT
-          [Service]
-          EnvironmentFile=${ENV_FILE}
-          EOT
-            sudo systemctl daemon-reload
-          fi
-
-          echo "[remote] Restarting Tomcat..."
-          sudo systemctl restart "$TOMCAT_SERVICE_NAME"
-
-          echo "[remote] Health check: $HEALTH_URL"
-          MAX_ATTEMPTS=20
-          SLEEP_SECONDS=3
-          attempt=1
-          while (( attempt <= MAX_ATTEMPTS )); do
-            if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then
-              echo "[remote] Health check OK on attempt $attempt"
-              exit 0
-            fi
-            echo "[remote] Health check failed ($attempt/$MAX_ATTEMPTS). Retrying in ${SLEEP_SECONDS}s..."
-            sleep "$SLEEP_SECONDS"
-            ((attempt++))
-          done
-
-          echo "[remote] Health check failed after ${MAX_ATTEMPTS} attempts."
-          echo "[remote] ---- Diagnostics (PPPP) ----"
-          sudo systemctl status "$TOMCAT_SERVICE_NAME" --no-pager || true
-          sudo journalctl -u "$TOMCAT_SERVICE_NAME" -n 200 --no-pager || true
-          echo "[remote] webapps dir:"
-          ls -la /opt/tomcat/webapps || true
-          echo "[remote] ---- End diagnostics ----"
-          exit 1
-          EOF
