@@ -1,0 +1,254 @@
+name: CI/CD - HelloWar (Phase-1)
+
+# Setting up run name dynamically or as run-description entered(when non empty) ---- Else all runs look same (no commit message as in when pushed)
+# Defaults to manual trigger (also as description input also defaults to same)
+run-name: >
+  ${{ github.event.inputs.run_description != '' && github.event.inputs.run_description || 'Manual Trigger' }}
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_description:
+        description: 'Description of this run'
+        required: false
+        default: 'Manual Trigger'
+      skip_sonar:
+        description: 'Skip SonarCloud Scan?'
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      JFROG_USER: ${{ secrets.JFROG_USER_CI }}
+      JFROG_TOKEN: ${{ secrets.JFROG_TOKEN_CI }}
+
+
+    steps:
+      - name: Show run description
+        run: | #multi-line due to yaml parser being picky of : after description
+          echo "Run Description: ${{ github.event.inputs.run_description }}"
+          echo "Skip SonarCloud Scan: ${{ github.event.inputs.skip_sonar }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # full history for SonarQube analysis -- History of All Commits / branches / tags. Not just current commit. Default = 1 (Current commit). Almost like git clone.
+          # Else sonar determination of new vs old code.
+          
+         
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+          # This will be used for across runs in this repo so initially disable to test Artifactory Cache.
+          # Caching between workflow runs.... caching ~/.m2/repository
+          cache: maven
+
+
+      - name: Write Maven settings (.m2/settings.xml)
+        # 'XML' heredoc - the env variables (env.JFROG_USER) will be written literally (no expansion of vars)
+        # <id> tages should match the ids in pom.xml 
+        run: |
+          mkdir -p $HOME/.m2
+          cat > $HOME/.m2/settings.xml <<'XML'
+          <settings>
+            <servers>
+
+              <!-- Read (downloads) via virtual -->
+              <server>
+                <id>maven-all</id>
+                <username>${env.JFROG_USER}</username>
+                <password>${env.JFROG_TOKEN}</password>
+              </server>
+
+              <server>
+                <id>devopsbyte-maven-releases</id>
+                <username>${env.JFROG_USER}</username>
+                <password>${env.JFROG_TOKEN}</password>
+              </server>
+
+              <server>
+                <id>devopsbyte-maven-snapshots</id>
+                <username>${env.JFROG_USER}</username>
+                <password>${env.JFROG_TOKEN}</password>
+              </server>
+
+            </servers>
+
+            <mirrors>
+              <mirror>
+                <id>maven-all</id>
+                <url>https://devopsbyte.jfrog.io/artifactory/maven-all</url>
+                <mirrorOf>*</mirrorOf>
+              </mirror>
+            </mirrors>
+          </settings>
+          XML
+
+
+      - name: Check Maven cache after restore
+        run: |
+          echo "After setup-java restore:"
+          du -sh ~/.m2/repository || echo "No Maven cache restored."
+
+          echo "--------------------------------------------"
+          echo "~/.m2/repository contents (first 50 lines):"
+          ls -R ~/.m2/repository | head -50 || true
+
+          echo "--------------------------------------------"
+          echo "~/.m2/ contents:"
+          ls -l ~/.m2/
+
+          echo "--------------------------------------------"
+          echo "settings.xml contents:"
+          cat ~/.m2/settings.xml || echo "No settings.xml"
+          
+
+
+      - name: Run unit tests # Fail Fast; if step fails - workflow exits
+        # -B : Batch mode (non-interactive, no progress bars, used for CI) | -ntp: no transfer progress | clean = deletes target dir before test
+        run: mvn -B -ntp clean test
+
+      
+      - name: SonarCloud Scan
+        #if: always() # continue even if previous steps fail (like tests)
+        if: ${{ github.event.inputs.skip_sonar != 'true' }}
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+          SONAR_ORG: ${{ vars.SONAR_ORG }}
+        run: |
+          mvn -B -ntp verify sonar:sonar \
+            -Dsonar.host.url=https://sonarcloud.io \
+            -Dsonar.organization=$SONAR_ORG \
+            -Dsonar.projectKey=$SONAR_PROJECT_KEY \
+            -Dsonar.login=${SONAR_TOKEN}
+
+            # Note: we are NOT using sonar.qualitygate.wait=true in Phase-1.
+
+
+      - name: Package WAR
+        run: mvn -B -ntp -DskipTests package
+
+
+      - name: Show artifact
+        run: ls -l target/*.war || true
+
+
+      - name: Upload WAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hello-war                  # constant, easy to download later
+          path: target/*.war
+          if-no-files-found: error
+          retention-days: 14
+
+
+
+      - name: Ship Artifact
+        run: mvn -B -ntp -DskipTests deploy
+
+
+
+
+
+
+deploy:
+  needs: build
+  runs-on: ubuntu-latest
+  permissions:
+    id-token: write
+    contents: read
+
+  steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-region: us-east-1
+        role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+
+    - name: Get EC2 IP dynamically
+      id: get_ip
+      uses: devopsbyte-internal/cicd-actions/.github/actions/get-ec2-ip@main
+      with:
+        instance-tag: "hellowar-tomcat-be"
+        aws-region: "us-east-1"
+
+    - name: Set EC2 host env
+      run: echo "EC2_HOST=${{ steps.get_ip.outputs.ec2_ip }}" >> $GITHUB_ENV
+
+    - name: Download WAR artifact from build job
+      uses: actions/download-artifact@v4
+      with:
+        name: hello-war
+        path: ./artifact
+
+    - name: Locate WAR file
+      run: |
+        set -euo pipefail
+        ls -la ./artifact
+        WAR_PATH="$(ls -1 ./artifact/*.war | head -n 1)"
+        echo "WAR_PATH=$WAR_PATH" >> $GITHUB_ENV
+        echo "Using WAR: $WAR_PATH"
+
+    - name: Start SSH agent
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+    - name: Copy WAR to EC2 (/tmp)
+      run: |
+        set -euo pipefail
+        scp -o StrictHostKeyChecking=no "$WAR_PATH" "${{ vars.EC2_USER }}@$EC2_HOST:/tmp/hellowar.war"
+
+    - name: Deploy WAR on EC2 (no deploy.sh)
+      run: |
+        set -euo pipefail
+        ssh -o StrictHostKeyChecking=no "${{ vars.EC2_USER }}@$EC2_HOST" "bash -s" << 'EOF'
+        set -euo pipefail
+
+        TOMCAT_SERVICE_NAME="tomcat"
+        TOMCAT_WEBAPPS_DIR="/opt/tomcat/webapps"
+        DEPLOY_WAR_PATH="${TOMCAT_WEBAPPS_DIR}/hellowar.war"
+        EXPLODED_DIR="${TOMCAT_WEBAPPS_DIR}/hellowar"
+        HEALTH_URL="http://localhost:8080/hellowar/"
+
+        echo "[remote] Validating Tomcat webapps dir..."
+        sudo test -d "$TOMCAT_WEBAPPS_DIR"
+
+        echo "[remote] Installing WAR..."
+        sudo cp /tmp/hellowar.war "$DEPLOY_WAR_PATH"
+        sudo chmod 640 "$DEPLOY_WAR_PATH"
+        sudo chown tomcat:tomcat "$DEPLOY_WAR_PATH" || true
+
+        echo "[remote] Removing exploded dir (if present)..."
+        sudo rm -rf "$EXPLODED_DIR" || true
+
+        echo "[remote] Restarting Tomcat..."
+        sudo systemctl restart "$TOMCAT_SERVICE_NAME"
+
+        echo "[remote] Health check: $HEALTH_URL"
+        MAX_ATTEMPTS=20
+        SLEEP_SECONDS=3
+        attempt=1
+        while (( attempt <= MAX_ATTEMPTS )); do
+          if curl -fsS "$HEALTH_URL" > /dev/null 2>&1; then
+            echo "[remote] Health check OK on attempt $attempt"
+            exit 0
+          fi
+          echo "[remote] Health check failed ($attempt/$MAX_ATTEMPTS). Retrying in ${SLEEP_SECONDS}s..."
+          sleep "$SLEEP_SECONDS"
+          ((attempt++))
+        done
+
+        echo "[remote] Health check failed after ${MAX_ATTEMPTS} attempts."
+        echo "[remote] Check logs under /opt/tomcat/logs"
+        exit 1
+        EOF
