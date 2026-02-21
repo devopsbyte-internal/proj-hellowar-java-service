@@ -18,18 +18,18 @@ on:
         type: boolean
         required: false
         default: true
-db_enabled:
-  description: 'Enable DB telemetry on the backend? (DB_ENABLED)'
-  type: choice
-  required: false
-  default: 'false'
-  options:
-    - 'false'
-    - 'true'
-release_number:
-  description: 'Release number exposed via API (RELEASE_NUMBER)'
-  required: false
-  default: 'manual'
+      db_enabled:
+        description: 'Enable DB telemetry on the backend? (DB_ENABLED)'
+        type: choice
+        required: false
+        default: 'false'
+        options:
+          - 'false'
+          - 'true'
+      release_number:
+        description: 'Release number exposed via API (RELEASE_NUMBER)'
+        required: false
+        default: 'manual'
 
 # -----------------------------
 # PPPP NOTE:
